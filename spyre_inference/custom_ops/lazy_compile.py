@@ -23,6 +23,7 @@ while nothing is tracing has no enclosing graph, so it is the outermost one --
 from __future__ import annotations
 
 import functools
+import weakref
 from collections.abc import Callable
 from typing import TypeVar, cast
 
@@ -34,6 +35,20 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 F = TypeVar("F", bound=Callable)
+
+# Weak references to every live CompileOutermost instance so that
+# reset_compiled_kernels() can clear them without keeping them alive.
+_instances: weakref.WeakSet[CompileOutermost] = weakref.WeakSet()
+
+
+def reset_compiled_kernels() -> None:
+    """Clear the in-memory compiled kernel on every live CompileOutermost instance.
+
+    After this call the next forward pass on each instance recompiles from scratch.
+    Intended for benchmarking only — do not call in production serving.
+    """
+    for inst in _instances:
+        inst.spyre_compiled_kernel = None
 
 
 class CompileOutermost:
@@ -71,6 +86,7 @@ class CompileOutermost:
         mode = get_cached_compilation_config().mode
         self.spyre_compile_enabled = mode is not CompilationMode.NONE
         self.spyre_compiled_kernel = None
+        _instances.add(self)
 
 
 def maybe_compile(method: F | None = None, *, force: bool = False) -> F:
