@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_MAX_CORES: int = 0
     SPYRE_BATCHED_DECODE: bool = True
     SPYRE_KERNEL_CACHE: bool = False
+    SPYRE_CLEAR_CONV_CACHE: bool = False
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
     SPYRE_MOE_GATHERED_MAX_TOKENS: int = 4
     SPYRE_NUM_CPUS: int = 0
@@ -110,6 +111,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # disk. Off by default. TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 disables the cache
     # even when this flag is enabled.
     "SPYRE_KERNEL_CACHE": lambda: os.getenv("SPYRE_KERNEL_CACHE", "0") == "1",
+    # When "1", clear the in-memory compiled conv kernel at the start of every
+    # execute_model call so that each inference run recompiles from scratch.
+    # Off by default. Intended for benchmarking only: enabling it means every run
+    # pays a full Inductor compile cost mid-request and does not represent
+    # production serving performance.
+    "SPYRE_CLEAR_CONV_CACHE": lambda: os.getenv("SPYRE_CLEAR_CONV_CACHE", "0") == "1",
     # Maximum number of sequences allowed to prefill in the same batch. "1" (default)
     # serialises prefills, so a batch spends the whole token budget on one prompt
     # instead of topping itself up with a short chunk of the next. Any non-positive

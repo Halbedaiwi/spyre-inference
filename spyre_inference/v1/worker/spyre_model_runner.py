@@ -39,6 +39,7 @@ the CPU fallbacks will be obsolete and most operations will be performed on Spyr
 from __future__ import annotations
 
 import bisect
+import threading
 import time
 from contextlib import contextmanager
 from typing import Any, cast
@@ -72,6 +73,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from spyre_inference import envs
 from spyre_inference.custom_ops.bert_head_pad import install_bert_head_pad
 from spyre_inference.custom_ops.conv import SpyreConv2d
+from spyre_inference.custom_ops.lazy_compile import reset_compiled_kernels
 from spyre_inference.custom_ops.head_pad import (
     fix_padded_attention_scale,
     fix_padded_rope,
@@ -1697,6 +1699,54 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     # --- Stubs copied from CPUModelRunner ---
     # These are trivial overrides that GPUModelRunner expects.
+
+    def _schedule_kernel_reset(self) -> None:
+        """Start (or restart) a 5-second idle timer.
+
+        If no new request arrives within 5 seconds of the last request
+        finishing, fire a full dynamo + conv kernel reset so the next bench
+        run starts cold. Cancelled and restarted on every request completion
+        so back-to-back requests within a run never trigger the reset.
+        """
+        existing = getattr(self, "_kernel_reset_timer", None)
+        if existing is not None:
+            existing.cancel()
+
+        def _do_reset():
+            logger.info(
+                "SPYRE_CLEAR_CONV_CACHE: 5s idle timeout — clearing all compiled kernels"
+            )
+            torch._dynamo.reset()
+            reset_compiled_kernels()
+            self._kernel_reset_timer = None
+            logger.info(
+                "SPYRE_CLEAR_CONV_CACHE: reset complete — ready for next run"
+            )
+
+        timer = threading.Timer(5.0, _do_reset)
+        timer.daemon = True
+        timer.start()
+        self._kernel_reset_timer = timer
+
+    def execute_model(self, scheduler_output=None, *args, **kwargs):
+        if envs.SPYRE_CLEAR_CONV_CACHE and scheduler_output is not None:
+            total_tokens = getattr(scheduler_output, "total_num_scheduled_tokens", None)
+            finished = getattr(scheduler_output, "finished_req_ids", None)
+            # A request just finished — (re)start the idle timer. If no new
+            # request arrives within 5 seconds the timer fires the reset.
+            # A new request arriving cancels the timer before it fires.
+            if finished and total_tokens == 0:
+                self._schedule_kernel_reset()
+            # New request arriving — cancel any pending reset timer so requests
+            # within the same bench run don't pay a spurious recompile.
+            elif total_tokens and total_tokens > 0:
+                existing = getattr(self, "_kernel_reset_timer", None)
+                if existing is not None:
+                    existing.cancel()
+                    self._kernel_reset_timer = None
+        if scheduler_output is not None:
+            return super().execute_model(scheduler_output, *args, **kwargs)
+        return super().execute_model(*args, **kwargs)
 
     def _init_device_properties(self) -> None:
         # No CUDA/GPU device properties to query for Spyre
