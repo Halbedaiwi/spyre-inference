@@ -41,6 +41,8 @@ from __future__ import annotations
 import bisect
 import threading
 import time
+import urllib.error
+import urllib.request
 from contextlib import contextmanager
 from typing import Any, cast
 
@@ -51,6 +53,7 @@ import torch.nn.functional as F
 from torch.utils._pytree import tree_map
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig
+from vllm.distributed import get_world_group
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import Attention
@@ -73,7 +76,6 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from spyre_inference import envs
 from spyre_inference.custom_ops.bert_head_pad import install_bert_head_pad
 from spyre_inference.custom_ops.conv import SpyreConv2d
-from spyre_inference.custom_ops.lazy_compile import reset_compiled_kernels
 from spyre_inference.custom_ops.head_pad import (
     fix_padded_attention_scale,
     fix_padded_rope,
@@ -81,6 +83,7 @@ from spyre_inference.custom_ops.head_pad import (
     install_padded_head_dim,
     verify_padded_head_dim,
 )
+from spyre_inference.custom_ops.lazy_compile import reset_compiled_kernels
 from spyre_inference.custom_ops.mlp_pad import (
     install_mlp_pad_weight_loader,
     verify_padded_intermediate_size,
@@ -127,6 +130,12 @@ _PAD_SLOT_ID = -1
 
 # Steps between encoder dispatch-ratio log lines.
 _ENCODER_DISPATCH_LOG_EVERY = 200
+
+# SPYRE_CLEAR_CONV_CACHE is a dev/benchmark feature: it assumes `vllm serve` on the
+# default port. The routes need VLLM_SERVER_DEV_MODE=1 (set in spyre_inference/__init__).
+_SERVER_BASE_URL = "http://127.0.0.1:8000"
+_SERVER_CACHE_RESET_ENDPOINTS = ("reset_mm_cache", "reset_encoder_cache", "reset_prefix_cache")
+_SERVER_RESET_TIMEOUT_S = 10
 
 
 def _compute_slot_mapping_impl(
@@ -1700,6 +1709,36 @@ class TorchSpyreModelRunner(GPUModelRunner):
     # --- Stubs copied from CPUModelRunner ---
     # These are trivial overrides that GPUModelRunner expects.
 
+    def _reset_server_caches(self) -> bool:
+        """POST the server's cache-reset routes (rank 0 only). True if all returned 200."""
+        for endpoint in _SERVER_CACHE_RESET_ENDPOINTS:
+            url = f"{_SERVER_BASE_URL}/{endpoint}"
+            logger.info("SPYRE_CLEAR_CONV_CACHE: POST %s", url)
+            try:
+                req = urllib.request.Request(url, method="POST")
+                with urllib.request.urlopen(req, timeout=_SERVER_RESET_TIMEOUT_S) as resp:
+                    status = resp.status
+            except urllib.error.HTTPError as e:
+                status = e.code
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                logger.error(
+                    "SPYRE_CLEAR_CONV_CACHE: %s failed (%s); is the server on %s?",
+                    endpoint,
+                    e,
+                    _SERVER_BASE_URL,
+                )
+                return False
+            if status != 200:
+                logger.error(
+                    "SPYRE_CLEAR_CONV_CACHE: %s returned HTTP %d%s",
+                    endpoint,
+                    status,
+                    " (needs VLLM_SERVER_DEV_MODE=1 on the server)" if status == 404 else "",
+                )
+                return False
+            logger.info("SPYRE_CLEAR_CONV_CACHE: %s -> HTTP %d", endpoint, status)
+        return True
+
     def _schedule_kernel_reset(self) -> None:
         """Start (or restart) a 5-second idle timer.
 
@@ -1713,15 +1752,20 @@ class TorchSpyreModelRunner(GPUModelRunner):
             existing.cancel()
 
         def _do_reset():
-            logger.info(
-                "SPYRE_CLEAR_CONV_CACHE: 5s idle timeout — clearing all compiled kernels"
-            )
+            logger.info("SPYRE_CLEAR_CONV_CACHE: 5s idle timeout — clearing all compiled kernels")
             torch._dynamo.reset()
             reset_compiled_kernels()
             self._kernel_reset_timer = None
-            logger.info(
-                "SPYRE_CLEAR_CONV_CACHE: reset complete — ready for next run"
-            )
+            logger.info("SPYRE_CLEAR_CONV_CACHE: compiled kernels cleared on this rank")
+            # The server-side caches are shared, so only one rank resets them.
+            if get_world_group().rank != 0:
+                return
+            if self._reset_server_caches():
+                logger.info("SPYRE_CLEAR_CONV_CACHE: reset complete — ready for next run")
+            else:
+                logger.error(
+                    "SPYRE_CLEAR_CONV_CACHE: server cache reset failed — next run is NOT cold"
+                )
 
         timer = threading.Timer(5.0, _do_reset)
         timer.daemon = True
