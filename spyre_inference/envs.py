@@ -116,11 +116,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # shards are gathered on the CPU. Needs OMP_WAIT_POLICY=PASSIVE (spinning OpenMP
     # threads otherwise slow the next step).
     "SPYRE_LOGITS_CPU_GATHER": lambda: os.getenv("SPYRE_LOGITS_CPU_GATHER", "0") == "1",
-    # When "1", clear the in-memory compiled conv kernel at the start of every
-    # execute_model call so that each inference run recompiles from scratch.
-    # Off by default. Intended for benchmarking only: enabling it means every run
-    # pays a full Inductor compile cost mid-request and does not represent
-    # production serving performance.
+    # When "1", after 5s with no work: reset dynamo and the compiled kernels on every
+    # rank, then (rank 0) POST /reset_mm_cache, /reset_encoder_cache and
+    # /reset_prefix_cache to http://127.0.0.1:8000, so the next benchmark run starts
+    # cold. Also sets VLLM_SERVER_DEV_MODE=1 (those routes need it), which exposes
+    # vLLM's other dev-only routes. Off by default; benchmarking only, assumes port 8000.
     "SPYRE_CLEAR_CONV_CACHE": lambda: os.getenv("SPYRE_CLEAR_CONV_CACHE", "0") == "1",
     # Maximum number of sequences allowed to prefill in the same batch. "1" (default)
     # serialises prefills, so a batch spends the whole token budget on one prompt
