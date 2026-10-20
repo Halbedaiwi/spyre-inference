@@ -1772,25 +1772,21 @@ class TorchSpyreModelRunner(GPUModelRunner):
         timer.start()
         self._kernel_reset_timer = timer
 
-    def execute_model(self, scheduler_output=None, *args, **kwargs):
-        if envs.SPYRE_CLEAR_CONV_CACHE and scheduler_output is not None:
-            total_tokens = getattr(scheduler_output, "total_num_scheduled_tokens", None)
-            finished = getattr(scheduler_output, "finished_req_ids", None)
-            # A request just finished — (re)start the idle timer. If no new
-            # request arrives within 5 seconds the timer fires the reset.
-            # A new request arriving cancels the timer before it fires.
-            if finished and total_tokens == 0:
-                self._schedule_kernel_reset()
-            # New request arriving — cancel any pending reset timer so requests
-            # within the same bench run don't pay a spurious recompile.
-            elif total_tokens and total_tokens > 0:
-                existing = getattr(self, "_kernel_reset_timer", None)
-                if existing is not None:
-                    existing.cancel()
-                    self._kernel_reset_timer = None
-        if scheduler_output is not None:
-            return super().execute_model(scheduler_output, *args, **kwargs)
-        return super().execute_model(*args, **kwargs)
+    def _track_idle_for_kernel_reset(self, scheduler_output) -> None:
+        """Arm the idle timer when a request finishes; cancel it when work arrives."""
+        total_tokens = scheduler_output.total_num_scheduled_tokens
+        if scheduler_output.finished_req_ids and total_tokens == 0:
+            self._schedule_kernel_reset()
+        elif total_tokens > 0:
+            existing = getattr(self, "_kernel_reset_timer", None)
+            if existing is not None:
+                existing.cancel()
+                self._kernel_reset_timer = None
+
+    def execute_model(self, scheduler_output, *args, **kwargs):
+        if envs.SPYRE_CLEAR_CONV_CACHE:
+            self._track_idle_for_kernel_reset(scheduler_output)
+        return super().execute_model(scheduler_output, *args, **kwargs)
 
     def _init_device_properties(self) -> None:
         # No CUDA/GPU device properties to query for Spyre

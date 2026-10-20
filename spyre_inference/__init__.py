@@ -25,11 +25,6 @@ from typing import Any
 # library can't load before init_device runs.
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
-# SPYRE_CLEAR_CONV_CACHE resets the server caches over HTTP, and those routes only
-# exist when the API server starts with VLLM_SERVER_DEV_MODE=1. An explicit value wins.
-if os.environ.get("SPYRE_CLEAR_CONV_CACHE") == "1":
-    os.environ.setdefault("VLLM_SERVER_DEV_MODE", "1")
-
 __version__ = importlib.metadata.version("spyre_inference")
 
 
@@ -95,3 +90,12 @@ def _init_logging():
 
 
 _init_logging()
+
+# SPYRE_CLEAR_CONV_CACHE resets the server caches over HTTP, and those routes only
+# exist when the API server starts with VLLM_SERVER_DEV_MODE=1. An explicit value wins.
+if os.environ.get("SPYRE_CLEAR_CONV_CACHE") == "1" and "VLLM_SERVER_DEV_MODE" not in os.environ:
+    os.environ["VLLM_SERVER_DEV_MODE"] = "1"
+    logger.warning(
+        "SPYRE_CLEAR_CONV_CACHE=1 enabled VLLM_SERVER_DEV_MODE=1; vLLM's dev-only "
+        "routes are exposed on the API server's host."
+    )
