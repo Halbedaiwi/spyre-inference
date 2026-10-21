@@ -93,7 +93,9 @@ _init_logging()
 # exist when the API server starts with VLLM_SERVER_DEV_MODE=1. An explicit value wins.
 if os.environ.get("SPYRE_CLEAR_CONV_CACHE") == "1" and "VLLM_SERVER_DEV_MODE" not in os.environ:
     os.environ["VLLM_SERVER_DEV_MODE"] = "1"
-    logger.warning(
+    from vllm.logger import init_logger
+
+    init_logger(__name__).warning(
         "SPYRE_CLEAR_CONV_CACHE=1 enabled VLLM_SERVER_DEV_MODE=1; vLLM's dev-only "
         "routes are exposed on the API server's host."
     )
