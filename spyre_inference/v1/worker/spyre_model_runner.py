@@ -550,6 +550,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
     """
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        # SPYRE_CLEAR_CONV_CACHE: the idle timer thread only flags a reset; the
+        # engine thread performs it. The lock keeps cancel and fire from interleaving.
+        self._kernel_reset_lock = threading.Lock()
+        self._kernel_reset_timer: threading.Timer | None = None
+        self._kernel_reset_due = threading.Event()
+
         # Store the real Spyre device before super().__init__ so that
         # _make_buffer can place .gpu tensors on Spyre directly.
         self._spyre_device = device
@@ -1739,24 +1745,34 @@ class TorchSpyreModelRunner(GPUModelRunner):
             logger.info("SPYRE_CLEAR_CONV_CACHE: %s -> HTTP %d", endpoint, status)
         return True
 
+    def _cancel_kernel_reset_timer(self) -> None:
+        with self._kernel_reset_lock:
+            if self._kernel_reset_timer is not None:
+                self._kernel_reset_timer.cancel()
+                self._kernel_reset_timer = None
+
     def _schedule_kernel_reset(self) -> None:
         """Start (or restart) a 5-second idle timer.
 
-        If no new request arrives within 5 seconds of the last request
-        finishing, fire a full dynamo + conv kernel reset so the next bench
-        run starts cold. Cancelled and restarted on every request completion
-        so back-to-back requests within a run never trigger the reset.
+        If no new request arrives within 5 seconds of the last request finishing,
+        the timer resets the server caches (rank 0) and marks the compiled kernels
+        for clearing; the engine thread clears them before its next step, so a
+        step never runs on kernels being torn down. Cancelled and restarted on
+        every request completion so back-to-back requests never trigger it.
         """
-        existing = getattr(self, "_kernel_reset_timer", None)
-        if existing is not None:
-            existing.cancel()
+        self._cancel_kernel_reset_timer()
 
-        def _do_reset():
-            logger.info("SPYRE_CLEAR_CONV_CACHE: 5s idle timeout — clearing all compiled kernels")
-            torch._dynamo.reset()
-            reset_compiled_kernels()
-            self._kernel_reset_timer = None
-            logger.info("SPYRE_CLEAR_CONV_CACHE: compiled kernels cleared on this rank")
+        def _on_idle():
+            with self._kernel_reset_lock:
+                # A request that arrived meanwhile replaced or cancelled this timer.
+                if self._kernel_reset_timer is not timer:
+                    return
+                self._kernel_reset_timer = None
+                self._kernel_reset_due.set()
+            logger.info(
+                "SPYRE_CLEAR_CONV_CACHE: 5s idle timeout — compiled kernels are cleared "
+                "before the next step"
+            )
             # The server-side caches are shared, so only one rank resets them.
             if get_world_group().rank != 0:
                 return
@@ -1767,10 +1783,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     "SPYRE_CLEAR_CONV_CACHE: server cache reset failed — next run is NOT cold"
                 )
 
-        timer = threading.Timer(5.0, _do_reset)
+        timer = threading.Timer(5.0, _on_idle)
         timer.daemon = True
+        with self._kernel_reset_lock:
+            self._kernel_reset_timer = timer
         timer.start()
-        self._kernel_reset_timer = timer
 
     def _track_idle_for_kernel_reset(self, scheduler_output) -> None:
         """Arm the idle timer when a request finishes; cancel it when work arrives."""
@@ -1778,14 +1795,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if scheduler_output.finished_req_ids and total_tokens == 0:
             self._schedule_kernel_reset()
         elif total_tokens > 0:
-            existing = getattr(self, "_kernel_reset_timer", None)
-            if existing is not None:
-                existing.cancel()
-                self._kernel_reset_timer = None
+            self._cancel_kernel_reset_timer()
 
     def execute_model(self, scheduler_output, *args, **kwargs):
         if envs.SPYRE_CLEAR_CONV_CACHE:
             self._track_idle_for_kernel_reset(scheduler_output)
+            if self._kernel_reset_due.is_set():
+                self._kernel_reset_due.clear()
+                torch._dynamo.reset()
+                reset_compiled_kernels()
+                logger.info("SPYRE_CLEAR_CONV_CACHE: compiled kernels cleared on this rank")
         return super().execute_model(scheduler_output, *args, **kwargs)
 
     def _init_device_properties(self) -> None:
